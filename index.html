@@ -639,6 +639,40 @@ function setSyncStatus(state, text) {
 let isSyncing  = false;   // true أثناء POST للشيت
 let lastPushAt = 0;       // وقت آخر push محلي (ms)
 
+// ── Baseline للدمج: آخر نسخة معروفة ومتفق عليها مع السيرفر ──
+// (تُستخدم عشان نعرف فرق إيه اللي أنا عدلته بالظبط، مش نبعت نسختي المحلية
+//  كاملة وبس فوق أي تعديل حصل عند زميل تاني في نفس الوقت)
+let lastSyncedPoints  = [];
+let lastSyncedBenches = [];
+
+// دمج "3 جوانب" (base / mine / theirs) بمفتاح unique معين
+// base   = آخر نسخة كنا متفقين عليها مع السيرفر
+// mine   = نسختي المحلية الحالية (ممكن فيها إضافة/تعديل/حذف عملته أنا)
+// theirs = أحدث نسخة فعلية من السيرفر (ممكن فيها تغييرات حصلت من زميل تاني)
+// النتيجة = اتحاد التغييرات الاتنين مع بعض، من غير ما حد يمسح تعديلات حد
+function mergeByKey(base, mine, theirs, key) {
+  const baseMap   = new Map((base   || []).map(x => [x[key], x]));
+  const mineMap   = new Map((mine   || []).map(x => [x[key], x]));
+  const theirsMap = new Map((theirs || []).map(x => [x[key], x]));
+  const allKeys = new Set([...baseMap.keys(), ...mineMap.keys(), ...theirsMap.keys()]);
+  const result = [];
+  allKeys.forEach(k => {
+    const b = baseMap.get(k), m = mineMap.get(k), t = theirsMap.get(k);
+    const mChanged = !!m && (!b || JSON.stringify(m) !== JSON.stringify(b));
+    const mDeleted = !!b && !m;
+    const tChanged = !!t && (!b || JSON.stringify(t) !== JSON.stringify(b));
+    const tDeleted = !!b && !t;
+
+    if (mDeleted && !tChanged) return;                       // أنا حذفته وهو متغيرش عند غيري → يفضل محذوف
+    if (tDeleted && !mChanged) return;                        // غيري حذفه وأنا متغيرتوش → يفضل محذوف
+    if (mDeleted && tChanged)  { result.push(t); return; }    // تعارض: حذفته وبعدين عدّله زميل → نرجّعه
+    if (tDeleted && mChanged)  { result.push(m); return; }    // تعارض: زميل حذفه وأنا عدّلته → نسيب تعديلي
+    if (m) { result.push(m); return; }                        // تعديلي/إضافتي يفوز لو في تعارض تعديل
+    if (t) { result.push(t); return; }                        // مفيش تعديل عندي → ناخد نسخة السيرفر
+  });
+  return result;
+}
+
 async function syncToSheets(force) {
   const url = getSheetsUrl();
   if (!url) { setSyncStatus('', 'غير متصل'); return; }
@@ -646,12 +680,40 @@ async function syncToSheets(force) {
   lastPushAt = Date.now();
   setSyncStatus('busy', 'جاري الحفظ...');
   try {
+    // قبل ما نكتب فوق الشيت، نجيب أحدث نسخة فعلية منه دلوقتي بالظبط،
+    // وندمجها مع أي تعديل عملته أنا — عشان متعديلات حد تاني (حصلت بعد آخر
+    // مرة فتحت/حدثت الصفحة) متتمسحش لو نسختي المحلية بقت قديمة.
+    const remote = await fetchFromSheets();
+    let pushPoints  = points;
+    let pushBenches = benches;
+
+    if (remote) {
+      const remotePoints  = dedupePoints(remote.points || []);
+      const remoteBenches = Array.isArray(remote.benches) ? remote.benches : [];
+      pushPoints  = mergeByKey(lastSyncedPoints,  points,  remotePoints,  'num').sort((a,b)=>a.num-b.num);
+      pushBenches = mergeByKey(lastSyncedBenches, benches, remoteBenches, 'id');
+
+      const changed = JSON.stringify(pushPoints) !== JSON.stringify(points) ||
+                       JSON.stringify(pushBenches) !== JSON.stringify(benches);
+      if (changed) {
+        points  = pushPoints;
+        benches = pushBenches;
+        localStorage.setItem(SK_DATA, JSON.stringify(points));
+        localStorage.setItem(SK_BENCH, JSON.stringify(benches));
+        if (document.getElementById('list'))     filterPoints();
+        if (document.getElementById('benchList')) filterBench();
+      }
+    }
+
     await fetch(url, {
       method: 'POST',
       mode: 'no-cors',
       headers: { 'Content-Type': 'text/plain' },
-      body: JSON.stringify({ points: points, benches: benches })
+      body: JSON.stringify({ points: pushPoints, benches: pushBenches })
     });
+    // دلوقتي ده آخر شكل متفق عليه مع السيرفر فعلاً
+    lastSyncedPoints  = JSON.parse(JSON.stringify(pushPoints));
+    lastSyncedBenches = JSON.parse(JSON.stringify(pushBenches));
     setSyncStatus('ok', 'محفوظ في Sheets ✓');
   } catch(e) {
     setSyncStatus('err', 'خطأ في الاتصال');
@@ -708,6 +770,7 @@ async function pollSheets() {
         localStorage.setItem(SK_DATA, JSON.stringify(points));
         filterPoints();
       }
+      lastSyncedPoints = JSON.parse(JSON.stringify(cleaned));
     }
     // Benches
     if (remote.benches && Array.isArray(remote.benches) && remote.benches.length) {
@@ -717,6 +780,7 @@ async function pollSheets() {
         localStorage.setItem(SK_BENCH, JSON.stringify(benches));
         filterBench();
       }
+      lastSyncedBenches = JSON.parse(JSON.stringify(remote.benches));
     }
     setSyncStatus('ok', 'تم التحديث من Sheets');
   }
@@ -767,6 +831,7 @@ async function showApp() {
   // Load local copy first so something shows immediately
   points = loadPoints();
   filterPoints();
+  lastSyncedPoints = JSON.parse(JSON.stringify(points));
 
   // If Sheets is connected, it is the single source of truth —
   // always pull the freshest copy on open instead of trusting local cache.
@@ -779,11 +844,13 @@ async function showApp() {
         points = dedupePoints(remote.points);
         localStorage.setItem(SK_DATA, JSON.stringify(points));
         filterPoints();
+        lastSyncedPoints = JSON.parse(JSON.stringify(points));
       }
       if (remote.benches && Array.isArray(remote.benches) && remote.benches.length) {
         benches = remote.benches;
         localStorage.setItem(SK_BENCH, JSON.stringify(benches));
         filterBench();
+        lastSyncedBenches = JSON.parse(JSON.stringify(benches));
       }
       setSyncStatus('ok', 'متصل بـ Sheets');
     } else {
@@ -798,7 +865,8 @@ function dedupePoints(arr) {
   const map = new Map();
   arr.forEach(p => {
     const num = parseInt(p.num);
-    map.set(num, { num, E: parseFloat(p.E), N: parseFloat(p.N), desc: String(p.desc) });
+    const zVal = (p.Z != null && p.Z !== '' && !isNaN(parseFloat(p.Z))) ? parseFloat(p.Z) : null;
+    map.set(num, { num, E: parseFloat(p.E), N: parseFloat(p.N), Z: zVal, desc: String(p.desc) });
   });
   return Array.from(map.values()).sort((a,b) => a.num - b.num);
 }
@@ -912,7 +980,13 @@ function getOrCreateSheet(name) {
 
 function doPost(e) {
   var lock = LockService.getScriptLock();
-  lock.waitLock(30000);
+  try {
+    lock.waitLock(30000); // استنى لغاية 30 ثانية لو في طلب تاني شغال دلوقتي
+  } catch (lockErr) {
+    return ContentService
+      .createTextOutput(JSON.stringify({ok: false, error: 'busy, try again'}))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
   try {
     var payload = JSON.parse(e.postData.contents);
 
@@ -920,24 +994,22 @@ function doPost(e) {
     if (payload.points && Array.isArray(payload.points)) {
       var ps = getOrCreateSheet('الثوابت');
       ps.clearContents();
-      var now = new Date().toLocaleString('ar');
-      var rows = [['رقم', 'E', 'N', 'وصف', 'آخر تحديث']];
+      ps.appendRow(['رقم', 'E', 'N', 'وصف', 'آخر تحديث']);
+      var now1 = new Date().toLocaleString('ar');
       payload.points.forEach(function(p) {
-        rows.push([p.num, p.E, p.N, p.desc, now]);
+        ps.appendRow([p.num, p.E, p.N, p.desc, now1]);
       });
-      ps.getRange(1, 1, rows.length, 5).setValues(rows);
     }
 
     // ── المناسيب (Benches) ────────────────────────────────
     if (payload.benches && Array.isArray(payload.benches)) {
       var bs = getOrCreateSheet('المناسيب');
       bs.clearContents();
+      bs.appendRow(['id', 'وصف', 'Z (م)', 'آخر تحديث']);
       var now2 = new Date().toLocaleString('ar');
-      var brows = [['id', 'وصف', 'Z (م)', 'آخر تحديث']];
       payload.benches.forEach(function(b) {
-        brows.push([b.id, b.desc, b.Z, now2]);
+        bs.appendRow([b.id, b.desc, b.Z, now2]);
       });
-      bs.getRange(1, 1, brows.length, 4).setValues(brows);
     }
 
     return ContentService
@@ -954,8 +1026,15 @@ function doPost(e) {
 }
 
 function doGet(e) {
+  // قفل برضو على القراية، عشان مانقراش الشيت في نص لحظة بتُمسح وتُكتب من تاني
   var lock = LockService.getScriptLock();
-  lock.waitLock(30000);
+  try {
+    lock.waitLock(30000);
+  } catch (lockErr) {
+    return ContentService
+      .createTextOutput(JSON.stringify({points: [], benches: [], error: 'busy'}))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
   try {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
 
