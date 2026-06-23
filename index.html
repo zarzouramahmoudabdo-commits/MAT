@@ -911,6 +911,8 @@ function getOrCreateSheet(name) {
 }
 
 function doPost(e) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
   try {
     var payload = JSON.parse(e.postData.contents);
 
@@ -918,20 +920,24 @@ function doPost(e) {
     if (payload.points && Array.isArray(payload.points)) {
       var ps = getOrCreateSheet('الثوابت');
       ps.clearContents();
-      ps.appendRow(['رقم', 'E', 'N', 'وصف', 'آخر تحديث']);
+      var now = new Date().toLocaleString('ar');
+      var rows = [['رقم', 'E', 'N', 'وصف', 'آخر تحديث']];
       payload.points.forEach(function(p) {
-        ps.appendRow([p.num, p.E, p.N, p.desc, new Date().toLocaleString('ar')]);
+        rows.push([p.num, p.E, p.N, p.desc, now]);
       });
+      ps.getRange(1, 1, rows.length, 5).setValues(rows);
     }
 
     // ── المناسيب (Benches) ────────────────────────────────
     if (payload.benches && Array.isArray(payload.benches)) {
       var bs = getOrCreateSheet('المناسيب');
       bs.clearContents();
-      bs.appendRow(['id', 'وصف', 'Z (م)', 'آخر تحديث']);
+      var now2 = new Date().toLocaleString('ar');
+      var brows = [['id', 'وصف', 'Z (م)', 'آخر تحديث']];
       payload.benches.forEach(function(b) {
-        bs.appendRow([b.id, b.desc, b.Z, new Date().toLocaleString('ar')]);
+        brows.push([b.id, b.desc, b.Z, now2]);
       });
+      bs.getRange(1, 1, brows.length, 4).setValues(brows);
     }
 
     return ContentService
@@ -942,10 +948,14 @@ function doPost(e) {
     return ContentService
       .createTextOutput(JSON.stringify({ok: false, error: err.message}))
       .setMimeType(ContentService.MimeType.JSON);
+  } finally {
+    lock.releaseLock();
   }
 }
 
 function doGet(e) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
   try {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
 
@@ -979,6 +989,8 @@ function doGet(e) {
     return ContentService
       .createTextOutput(JSON.stringify({points: [], benches: [], error: err.message}))
       .setMimeType(ContentService.MimeType.JSON);
+  } finally {
+    lock.releaseLock();
   }
 }`;
 
